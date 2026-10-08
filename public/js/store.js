@@ -73,6 +73,12 @@ export function createStore(initial) {
 /** Fresh (empty) match slice. */
 export const emptyMatch = () => ({ public: null, private: null, field: null, result: null, battle: null });
 
+/** Fresh (empty) account slice (DESIGN §27; fed by public/js/account.js). */
+export const emptySocial = () => ({
+  accountId: null, name: null, hasKey: false, keyFresh: null, error: null, synced: false,
+  friends: [], incoming: [], outgoing: [], met: [], invites: [], shareOrigin: null,
+});
+
 /** Initial app state (exported for tests and resets). */
 export const initialState = Object.freeze({
   connection: { status: 'idle', ping: null, attempt: 0, retryAt: 0, lastError: null, everOnline: false },
@@ -83,7 +89,8 @@ export const initialState = Object.freeze({
   ticker: [],
   emotes: [],
   clock: { offset: 0, rtt: null, synced: false },
-  ui: { pendingJoin: null, restoring: false, buildStale: false },
+  account: emptySocial(),
+  ui: { pendingJoin: null, restoring: false, buildStale: false, friendsOpen: false, keyOpen: false },
 });
 
 /** The app-wide store singleton. */

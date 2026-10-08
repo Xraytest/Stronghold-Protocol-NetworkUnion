@@ -5,7 +5,7 @@ import { N_ } from './i18n.js';
 export const PROTOCOL_VERSION = 1;
 /** Release version shown to players (title screen, server banner, /healthz). Kept equal to package.json "version"
  * (test/version.test.js); PROTOCOL_VERSION above is the separate wire-format number. */
-export const APP_VERSION = '0.2.1';
+export const APP_VERSION = '0.3.0';
 /** A development build (the public `dev` branch): the title screen, the boot banner and the README say so, and
  * tools/package.mjs refuses to build a release zip from it without --allow-dev. */
 export const DEV_BUILD = /-dev$/.test(APP_VERSION);
@@ -20,6 +20,26 @@ export const MAX_SEATS = 4;
 export const MAX_SPECTATORS = 2;
 export const ROOM_CODE_LEN = 4;
 export const NAME_MAX_LEN = 12;
+
+// ---- account & friends limits (DESIGN §27) ----------------------------------------------------------------------
+// The account layer (server/accounts.js) is the one part of the server that survives a restart, so every collection it
+// keeps is bounded: an unbounded friends list or "played together" ledger would be a memory/disk growth vector, and an
+// unbounded per-account fan-out would let one player make the server push thousands of frames on every room change.
+/** Most friends one account may have (a mutual edge counts once on each side). */
+export const MAX_FRIENDS = 100;
+/** Most "played together" partners one account remembers (newest kept; older ones fall off, so an old teammate can no
+ * longer be friended — the owner's rule is "only people you played with", which this bounds in time as well). */
+export const MAX_MET = 200;
+/** How long a "played together" edge stays usable for a friend request (90 days). */
+export const MET_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+/** Pending friend requests one account may hold per direction. */
+export const MAX_PENDING_REQUESTS = 50;
+/** How long an unaccepted quick invite stays valid. */
+export const INVITE_TTL_MS = 120_000;
+/** Pending quick invites one account may have sent at once. */
+export const MAX_INVITES_OUT = 20;
+/** Most invites one account may be shown at once (older ones are dropped). */
+export const MAX_INVITES_IN = 10;
 
 export const DIFFICULTIES = ['FUNNY', 'NORMAL', 'HARD', 'ABYSS'];
 export const DIFFICULTY_NAMES = { FUNNY: N_('标准模拟'), NORMAL: N_('险境模拟'), HARD: N_('绝境模拟'), ABYSS: N_('终极模拟') };
@@ -147,6 +167,15 @@ export const ERR = Object.freeze({
   TEMP_NOT_EMPTY: 'TEMP_NOT_EMPTY',
   ELIMINATED: 'ELIMINATED',
   SPECTATOR: 'SPECTATOR',         // a spectator seat only watches (MAX_SPECTATORS)
+  // account & friends (DESIGN §27)
+  ACCOUNT_REQUIRED: 'ACCOUNT_REQUIRED', // the intent needs an account (this session is a guest)
+  ACCOUNT_BAD_KEY: 'ACCOUNT_BAD_KEY',   // the presented account key is unknown
+  NAME_TAKEN: 'NAME_TAKEN',             // the account name is already in use (names are unique, case-folded)
+  NOT_ELIGIBLE: 'NOT_ELIGIBLE',         // not a person this account has played a match with (the only way to add)
+  NOT_FRIEND: 'NOT_FRIEND',             // the target is not a friend of this account
+  DECLINED: 'DECLINED',                 // the target recently declined a request from this account (cooldown)
+  INVITE_GONE: 'INVITE_GONE',           // the quick invite expired, was used, or belongs to someone else
+  TOO_MANY: 'TOO_MANY',                 // a bounded collection is full (friends / requests / invites)
   INTERNAL: 'INTERNAL',
 });
 
@@ -157,6 +186,9 @@ export const ERR_TEXT = {
   BAD_TILE: N_('无法部署在该位置'), BAD_TARGET: N_('无效的目标'), SOLD_OUT: N_('已售出'), MAX_LEVEL: N_('调度中心已达最高等级'),
   NOT_YOUR_TURN: N_('尚未轮到你'), ALREADY: N_('已完成该操作'), TEMP_NOT_EMPTY: N_('临时整备区不为空'), ELIMINATED: N_('你已被淘汰'),
   SPECTATOR: N_('观战中无法进行该操作'), INTERNAL: N_('服务器内部错误'),
+  ACCOUNT_REQUIRED: N_('该操作需要先创建账号'), ACCOUNT_BAD_KEY: N_('账号密钥无效'), NAME_TAKEN: N_('该名字已被使用'),
+  NOT_ELIGIBLE: N_('只有一起完成过作战的博士才能添加'), NOT_FRIEND: N_('对方不是你的好友'),
+  DECLINED: N_('对方暂时不接受好友申请'), INVITE_GONE: N_('邀请已失效'), TOO_MANY: N_('数量已达上限'),
 };
 
 // ---- Emotes (交流, research 09 §4) -----------------------------------------------------------------------------

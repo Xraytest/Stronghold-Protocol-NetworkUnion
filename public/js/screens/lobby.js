@@ -16,6 +16,7 @@ import { DIFFICULTIES, DIFFICULTY_NAMES, DIFFICULTY_COLORS, ROOM_CODE_LEN, MAX_S
 import { html, Button, Icon, MicroLabel, Panel, TextField, PingPill, AvatarFrame, Tooltip, Spinner, DifficultyIcon, doctorNo } from '../ui/components.js';
 import { toast, toastError } from '../ui/toasts.js';
 import { GuideButton } from '../ui/guide.js';
+import { FriendsButton } from '../ui/friends.js';
 import { LoadoutButton } from './loadout.js';
 import { net, identity } from '../net.js';
 import { store, useStore, shallowEqual, loadPref, savePref } from '../store.js';
@@ -246,6 +247,7 @@ export function LobbyScreen() {
     return DIFFICULTIES.includes(d) ? d : 'FUNNY';
   });
   const [code, setCode] = useState('');
+  const [hidden, setHidden] = useState(false); // 屏蔽好友: create the room without showing it in friends' lists
   const [busy, setBusy] = useState(null);
   const [recent] = useState(recentRooms);
   const alive = useRef(true);
@@ -268,7 +270,7 @@ export function LobbyScreen() {
       if (alive.current) setBusy(null);
     }
   };
-  const create = () => run('create', () => net.request('room.create', { mode: roomMode, difficulty }));
+  const create = () => run('create', () => net.request('room.create', { mode: roomMode, difficulty, ...(hidden ? { hidden: true } : {}) }));
   const join = (c = code) => {
     // `onClick=${join}` hands the click EVENT as the first argument, and a default parameter only applies to
     // `undefined` — codeArg keeps an event target out of the key and falls back to the input field
@@ -312,6 +314,7 @@ export function LobbyScreen() {
       </div>
       <div class="topbar__right">
         <${GuideButton} class="lobby-guide" variant="secondary" label=${t('玩法说明')} />
+        <${FriendsButton} class="lobby-friends" />
         <${LoadoutButton} from="lobby" size="sm" class="lobby-loadout" label=${t('干员调配')} />
         <div class="me-chip">
           <${AvatarFrame} size="sm" name=${me.name} seat=${0} self=${true} />
@@ -356,6 +359,11 @@ export function LobbyScreen() {
           ${DIFFICULTIES.map((d) => html`<${DifficultyCard} key=${d} roomMode=${roomMode} difficulty=${d} selected=${difficulty === d} onSelect=${pickDifficulty} />`)}
         </div>
         <div class="create-box">
+          ${roomMode === 'coop' ? html`<label class="create-hidden">
+            <input type="checkbox" checked=${hidden} onChange=${(e) => setHidden(!!e.currentTarget.checked)} />
+            <span>${t('屏蔽好友')}</span>
+            <span class="create-hidden__hint">${t('好友看不到这个房间，但仍可以直接邀请他们')}</span>
+          </label>` : null}
           <${Tooltip} block=${true} text=${online ? null : t('正在连接服务器…')}>
             <${Button} variant="primary" size="xl" block=${true} iconRight="chevrons" loading=${busy === 'create'} disabled=${!online} onClick=${create}>
               ${roomMode === 'solo' ? t('开始独立模拟') : t('创建同盟')}

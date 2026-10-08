@@ -17,8 +17,39 @@ export const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 
 /** startServer() options handed on to net.js Network / lobby.js Lobby (an absent one keeps that module's default). */
 const NET_OPTION_KEYS = ['reconnectWindowMs', 'heartbeatMs', 'helloTimeoutMs', 'ratePerSec', 'rateBurst', 'maxConnections', 'abuseDropsPerSec',
-  'maxConnectionsPerAddr', 'heavyPerSec', 'heavyBurst', 'trustProxy'];
-const LOBBY_OPTION_KEYS = ['lobbyGraceMs', 'maxRooms', 'maxRoomsPerAddr', 'maxMatchesPerAddr', 'resyncMinGapMs', 'soloReconnectWindowMs'];
+  'maxConnectionsPerAddr', 'heavyPerSec', 'heavyBurst', 'socialPerSec', 'socialBurst', 'trustProxy'];
+const LOBBY_OPTION_KEYS = ['lobbyGraceMs', 'maxRooms', 'maxRoomsPerAddr', 'maxMatchesPerAddr', 'resyncMinGapMs', 'soloReconnectWindowMs',
+  'publicOrigins', 'shareLink', 'friendPushMs', 'maxJoinFails', 'joinFailWindowMs'];
+
+/** Where the account file lives when the deployment did not say: SP_ACCOUNTS_FILE, else `<repo>/state/accounts.json`. */
+export function defaultAccountsFile() {
+  const env = process.env.SP_ACCOUNTS_FILE;
+  if (env != null && env !== '') return env === 'off' || env === '0' ? null : env;
+  return path.join(ROOT, 'state', 'accounts.json');
+}
+
+/**
+ * Account/store configuration (DESIGN §27). `accountsFile: null` (the programmatic default, and what tests get) keeps
+ * accounts in memory only: nothing is written to disk and a restart forgets every account. The CLI entry
+ * (server/index.js) passes `defaultAccountsFile()`, so `npm start` persists to `state/accounts.json` unless
+ * SP_ACCOUNTS_FILE points elsewhere (or says `off`).
+ * @param {{ [k: string]: any }} opts
+ */
+export function accountOptionsFrom(opts) {
+  const out = {};
+  if (opts.accountsFile !== undefined) out.file = opts.accountsFile;
+  if (opts.accountsMax !== undefined) out.maxAccounts = opts.accountsMax;
+  if (opts.accountsPerAddrPerHour !== undefined) out.createPerAddrPerHour = opts.accountsPerAddrPerHour;
+  if (opts.maxFriends !== undefined) out.maxFriends = opts.maxFriends;
+  if (opts.maxMet !== undefined) out.maxMet = opts.maxMet;
+  if (opts.inviteTtlMs !== undefined) out.inviteTtlMs = opts.inviteTtlMs;
+  if (opts.keyPepper !== undefined) out.keyPepper = opts.keyPepper;
+  else out.keyPepper = process.env.SP_KEY_PEPPER || '';
+  return out;
+}
+
+/** An env flag meaning "off" (unset / empty = on). */
+const isOff = (v) => ['0', 'off', 'false', 'no', 'never'].includes(String(v ?? '').trim().toLowerCase());
 
 /**
  * Where to listen: the `port` / `host` options, else PORT / HOST, else port 3000 on 0.0.0.0.
@@ -56,12 +87,14 @@ export function netOptionsFrom(opts) {
   return netOptions;
 }
 
-/** lobby.js Lobby options out of the startServer() options. */
+/** lobby.js Lobby options out of the startServer() options (publicOrigins / shareLink also come from the env). */
 export function lobbyOptionsFrom(opts) {
   const lobbyOptions = {};
   for (const k of LOBBY_OPTION_KEYS) {
     if (opts[k] != null) lobbyOptions[k] = opts[k];
   }
+  if (lobbyOptions.publicOrigins == null) lobbyOptions.publicOrigins = process.env.SP_PUBLIC_ORIGINS || '';
+  if (lobbyOptions.shareLink == null) lobbyOptions.shareLink = !isOff(process.env.SP_SHARE_LINK);
   return lobbyOptions;
 }
 

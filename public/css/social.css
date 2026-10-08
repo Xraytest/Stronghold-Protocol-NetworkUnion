@@ -1,0 +1,157 @@
+/* ==========================================================================================
+   social.css — accounts, friends, invites (DESIGN §27): the title account row, the friends
+   panel + button, the key dialog, the incoming-invite popup and the lobby 屏蔽好友 checkbox.
+
+   Same language as css/components.css: near-black panels, 1px lines, --mint accents, .brackets
+   corners, .micro labels. Sizes in rem (1rem = 100 design px at 1920×1080, css/theme.css).
+   ========================================================================================== */
+
+/* ---- compact friends button (lobby / room chrome) ---------------------------------------------- */
+.friends-btn { position: relative; }
+.friends-btn__count {
+  margin-left: .1em;
+  padding: 0 .05em;
+  min-width: .24rem;
+  text-align: center;
+  color: var(--mint-400);
+  font-weight: 700;
+}
+.friends-btn__badge {
+  position: absolute;
+  top: -.06rem;
+  right: -.06rem;
+  min-width: .24rem;
+  height: .24rem;
+  padding: 0 .05rem;
+  display: inline-grid;
+  place-items: center;
+  border-radius: .12rem;
+  background: var(--red);
+  color: #fff;
+  font-size: .14rem;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 0 0 1px var(--bg-0), 0 0 .1rem rgba(231, 49, 24, .55);
+}
+
+/* ---- account row (title screen) ---------------------------------------------------------------- */
+.acc-row {
+  --bk-c: var(--line-3);
+  --bk-l: .1rem;
+  display: flex;
+  flex-direction: column;
+  gap: .1rem;
+  margin-top: .12rem;
+  padding: .12rem .14rem;
+  background: rgba(16, 20, 18, .55);
+  border: 1px solid var(--line);
+  color: var(--text-lo);
+}
+.acc-row--on { --bk-c: var(--mint-500); }
+.acc-row__lead { display: flex; align-items: center; gap: .1rem; min-width: 0; }
+.acc-row__lead > .icon { width: .24rem; height: .24rem; color: var(--mint-500); flex: none; }
+.acc-row__text { display: flex; flex-direction: column; gap: .02rem; min-width: 0; }
+.acc-row__text > span { font-size: .16rem; color: var(--text-md); }
+.acc-row__name { font-size: .2rem; font-weight: 700; color: var(--text-hi); letter-spacing: .04em; }
+.acc-row__form { display: flex; align-items: flex-end; gap: .1rem; flex-wrap: wrap; }
+.acc-row__form .field { flex: 1 1 2.2rem; min-width: 1.8rem; }
+.acc-row__key { display: flex; align-items: flex-end; gap: .1rem; padding-top: .08rem; border-top: 1px dashed var(--line); }
+.acc-row__key .field { flex: 1 1 2.2rem; }
+
+/* ---- key dialog -------------------------------------------------------------------------------- */
+.keydlg { display: flex; flex-direction: column; gap: .16rem; }
+.keydlg__key {
+  padding: .2rem .22rem;
+  text-align: center;
+  font-size: .3rem;
+  font-weight: 700;
+  letter-spacing: .12em;
+  color: var(--mint-400);
+  background: linear-gradient(180deg, rgba(78, 216, 175, .08), rgba(13, 16, 15, .9));
+  border: 1px solid var(--mint-800);
+  text-shadow: 0 0 .18rem rgba(23, 249, 183, .35);
+  word-break: break-all;
+}
+.keydlg__warn {
+  display: flex;
+  align-items: flex-start;
+  gap: .1rem;
+  margin: 0;
+  font-size: .16rem;
+  line-height: 1.6;
+  color: var(--amber);
+}
+.keydlg__warn .icon { width: .22rem; height: .22rem; flex: none; margin-top: .01rem; }
+
+/* ---- friends panel ----------------------------------------------------------------------------- */
+.friends-body { min-height: 2.4rem; max-height: 9rem; overflow: auto; padding-top: .14rem; }
+.friends-empty { margin: .2rem 0; color: var(--text-dim); font-size: .17rem; line-height: 1.7; }
+.friends-sec { display: flex; flex-direction: column; gap: .06rem; }
+.friends-sec__head {
+  display: flex;
+  align-items: baseline;
+  gap: .12rem;
+  margin-top: .12rem;
+  padding-bottom: .05rem;
+  border-bottom: 1px solid var(--line);
+  font-size: .17rem;
+  color: var(--text-md);
+}
+.friend-list { display: flex; flex-direction: column; gap: .05rem; }
+.friend-row {
+  display: flex;
+  align-items: center;
+  gap: .14rem;
+  padding: .08rem .1rem;
+  background: rgba(255, 255, 255, .015);
+  border: 1px solid transparent;
+  border-left-color: var(--line);
+  transition: background var(--t-fast) var(--ease-out), border-color var(--t-fast) var(--ease-out);
+}
+.friend-row:hover { background: var(--mint-a10); border-left-color: var(--mint-700); }
+.friend-row__who { display: flex; flex-direction: column; gap: .02rem; min-width: 0; flex: 1 1 auto; }
+.friend-row__name { font-size: .19rem; font-weight: 600; color: var(--text-hi); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.friend-row__meta { font-size: .14rem; color: var(--text-lo); }
+.friend-row__status { font-size: .14rem; color: var(--text-lo); letter-spacing: .04em; }
+.friend-row__status.is-idle { color: var(--mint-500); }
+.friend-row__status.is-lobby { color: var(--ice); }
+.friend-row__status.is-match { color: var(--amber); }
+.friend-row__status.is-solo { color: var(--text-md); }
+.friend-row__status.is-hidden { color: var(--text-dim); }
+.friend-row__status.is-offline { color: var(--text-dim); }
+.friend-row__acts { display: flex; align-items: center; gap: .08rem; flex: none; }
+.friend-row__tag {
+  padding: .02rem .1rem;
+  font-size: .14rem;
+  color: var(--text-lo);
+  border: 1px solid var(--line-2);
+  letter-spacing: .06em;
+}
+
+/* ---- incoming invite popup --------------------------------------------------------------------- */
+.invite-pop { display: flex; flex-direction: column; gap: .14rem; }
+.invite-pop__from { margin: 0; font-size: .2rem; color: var(--text-hi); }
+.invite-pop__facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .1rem; }
+.invite-pop__facts > span {
+  display: flex;
+  flex-direction: column;
+  gap: .05rem;
+  padding: .1rem .12rem;
+  background: rgba(255, 255, 255, .02);
+  border: 1px solid var(--line);
+}
+.invite-pop__facts b { font-size: .22rem; font-weight: 700; color: var(--mint-400); }
+.invite-pop__ttl { margin: 0; text-align: right; font-size: .15rem; color: var(--amber); }
+
+/* ---- lobby 屏蔽好友 checkbox ------------------------------------------------------------------- */
+.create-hidden {
+  display: flex;
+  align-items: center;
+  gap: .1rem;
+  font-size: .16rem;
+  color: var(--text-md);
+  cursor: pointer;
+  user-select: none;
+}
+.create-hidden input { width: .2rem; height: .2rem; accent-color: var(--mint-500); cursor: pointer; }
+.create-hidden__hint { font-size: .14rem; color: var(--text-dim); }

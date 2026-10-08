@@ -10,7 +10,7 @@
 // entry/loading illustration names) it is layered under the CSS art; otherwise the screen is
 // pure CSS/SVG (radar, ridgelines, glow), so it never issues a request that can 404.
 
-import { useMemo, useState } from '../../vendor/hooks.module.js';
+import { useEffect, useMemo, useState } from '../../vendor/hooks.module.js';
 import { NAME_MAX_LEN, APP_VERSION, DEV_BUILD } from '../../../shared/constants.js';
 import { html, Button, Icon, MicroLabel, TextField, PingPill } from '../ui/components.js';
 import { GuideButton } from '../ui/guide.js';
@@ -24,6 +24,7 @@ import { t, N_ } from '../../../shared/i18n.js';
 import { scriptOf } from '../../../shared/i18nPacks.js';
 import { GIcon } from '../ui/gameComponents.js';
 import { SettingsModal } from '../ui/settings.js';
+import { AccountRow } from '../ui/friends.js';
 
 // Same character classes as server/net.js sanitizeName (control, zero-width, bidi, BOM), so a name
 // the client accepts is never rejected by the server's hello validation.
@@ -189,9 +190,15 @@ const STATUS_TEXT = {
 export function TitleScreen() {
   const conn = useStore((s) => s.connection, shallowEqual);
   const pendingJoin = useStore((s) => s.ui.pendingJoin);
+  const accName = useStore((s) => s.account.name);
   useLang(); // re-render on a language switch
   const [name, setName] = useState(() => store.get().me.name || identity.loadName() || '');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // A logged-in account's name is authoritative on the server (DESIGN §27): when the player creates or logs into an
+  // account on the title screen without having typed a call-sign, fill the field with it so 开始 needs no retyping.
+  useEffect(() => {
+    if (accName) setName((cur) => (cur.trim() ? cur : accName));
+  }, [accName]);
   const assetsSettled = useData('assets');
   const assets = data.get('assets');
   const backdrop = findUiAsset(assets, BACKDROP_KEYS);
@@ -268,6 +275,7 @@ export function TitleScreen() {
           placeholder=${t('输入你的代号（最多 {NAME_MAX_LEN} 字）', { NAME_MAX_LEN })} autoFocus=${!touchUi}
           onInput=${setName} onEnter=${start} />
         <${Button} variant="primary" size="xl" block=${true} iconRight="chevrons" disabled=${!valid} onClick=${start}>${t('开始')}<//>
+        <${AccountRow} name=${name} />
         <div class="title-conn">
           <span class=${`status-dot ${dotClass}`}></span>
           <span>${STATUS_TEXT[conn.status] ? t(STATUS_TEXT[conn.status]) : conn.status}</span>

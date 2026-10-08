@@ -21,6 +21,7 @@ import { copyText } from '../ui/clipboard.js';
 import { GuideButton } from '../ui/guide.js';
 import { LoadoutButton } from './loadout.js';
 import { net } from '../net.js';
+import { account } from '../account.js';
 import { store, useStore, shallowEqual, emptyMatch, isSpectating } from '../store.js';
 import { difficultyInfo } from './lobby.js';
 import { t, tc } from '../../../shared/i18n.js';
@@ -159,7 +160,13 @@ function InviteBox({ code, name, difficulty }) {
   const copy = async (what) => {
     // the copied link carries an invitation line (#103): 「{name}邀请你加入卫戍协议：盟约【{difficulty}】」
     const invite = t('{name}邀请你加入卫戍协议：盟约【{difficulty}】', { name: name ?? '', difficulty: DIFFICULTY_NAMES[difficulty] ? t(DIFFICULTY_NAMES[difficulty]) : '' });
-    const ok = await copyText(what === 'code' ? code : `${inviteLink(code)} ${invite}`);
+    // the link: the server's canonical share link when it has one, else this page's own address (accounts.js shareLink)
+    let text = code;
+    if (what === 'link') {
+      const share = await account.shareLink(code);
+      text = `${share?.url || inviteLink(code)} ${invite}`;
+    }
+    const ok = await copyText(text);
     if (ok) toast(what === 'code' ? t('已复制同盟密钥 {code}', { code }) : t('已复制邀请链接'), 'success');
     else toast(t('复制失败，请手动复制'), 'warn');
   };
@@ -169,6 +176,7 @@ function InviteBox({ code, name, difficulty }) {
     <div class="invite__btns">
       <${Button} size="sm" icon="copy" onClick=${() => copy('code')}>${t('复制密钥')}<//>
       <${Button} size="sm" icon="link" onClick=${() => copy('link')}>${t('复制链接')}<//>
+      <${Button} size="sm" icon="users" onClick=${() => account.setPanel(true)}>${t('邀请好友')}<//>
     </div>
   </div>`;
 }

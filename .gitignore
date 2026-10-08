@@ -43,3 +43,7 @@ desktop.ini
 .idea/
 .vscode/
 .claude/
+
+# --- Local server state (accounts & friends, DESIGN §27) ---------------------------------------------
+# npm start persists the account file here; it holds key HASHES only (never a key) but is still local data.
+state/

@@ -37,6 +37,7 @@ import { html, UiHosts, Button, MicroLabel, closeAllDialogs } from './ui/compone
 import { ConnectionBanner } from './ui/connBanner.js';
 import { ToastHost, toast, toastError, describeError } from './ui/toasts.js';
 import { net, identity, NetError } from './net.js';
+import { account, accountKey } from './account.js';
 import { store, useStore, emptyMatch, selectRoute, sessionResetNotice, isSpectating } from './store.js';
 import { data } from './data.js';
 import { GAME_FILES } from './ui/gameComponents.js';
@@ -47,6 +48,7 @@ import { GameScreen } from './screens/game.js';
 import { installAudio } from './audio.js';
 import { settingsStore } from './ui/settings.js';
 import { GuideHost } from './ui/guide.js';
+import { AccountHost } from './ui/friends.js';
 import { installDeviceSupport } from './ui/device.js';
 import { LoadoutHost } from './screens/loadout.js';
 import { installLoadoutSync, installOwnershipSync, installDiySync } from './ui/loadoutSync.js';
@@ -284,6 +286,7 @@ function App() {
     ${error ? html`<${ScreenCrashed} error=${error} reset=${resetError} />` : html`<${Screen} key=${route} />`}
     <${ConnectionBanner} />
     <${ToastHost} />
+    <${AccountHost} />
     <${UiHosts} />
     <${GuideHost} />
     <${LoadoutHost} />
@@ -339,6 +342,10 @@ async function boot() {
   }));
 
   wireNet();
+  // Accounts, friends and quick invites (DESIGN §27, public/js/account.js): its key cache is what `hello.key` carries,
+  // so the login survives a reload without the player typing anything.
+  net.getKey = () => accountKey();
+  account.install({ net, store });
   installLoadoutSync({ net });
   installOwnershipSync({ net });
   installDiySync({ net });
@@ -352,7 +359,12 @@ async function boot() {
   data.load('local').catch(() => {});
 
   const connectWhenReady = identityReady.then(() => {
+    // A cached account key is bound from the title screen too: with no hello the first account action (create, log in,
+    // the friends panel) would be refused with OFFLINE and friends would not see this player as online at all. The
+    // call-sign is only a hint here — the server puts the account's own name on the session (DESIGN §27).
+    const cachedName = savedName || account.stored?.name || '';
     if (entered) net.setName(savedName);
+    else if (accountKey() && cachedName) net.setName(cachedName);
     else net.connect();
   });
   // the language (and its UI translations) before the first render: no Chinese flash for an English player

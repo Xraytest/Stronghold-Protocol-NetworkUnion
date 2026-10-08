@@ -41,6 +41,7 @@ import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { C2S, validateC2S } from '../shared/protocol.js';
 import { ERR, ERR_TEXT, NAME_MAX_LEN, PROTOCOL_VERSION } from '../shared/constants.js';
+import { originFromHost } from '../shared/origin.js';
 
 /** Tunables (all overridable through the Network / SessionRegistry constructors). */
 export const NET_DEFAULTS = Object.freeze({
@@ -57,6 +58,8 @@ export const NET_DEFAULTS = Object.freeze({
   maxSessions: 20_000,          // registry cap; oldest idle sessions are evicted first
   heavyPerSec: 2,               // refill of the bucket for resend-heavy intents (HEAVY_TYPES)
   heavyBurst: 6,
+  socialPerSec: 2,              // refill of the bucket for account/friend/invite intents (SOCIAL_TYPES)
+  socialBurst: 10,              // a normal UI pass (create → sync → request → accept → invite) must fit in the burst
   trustProxy: 'auto',           // forwarding headers: 'auto' = from loopback/private peers only, true = always, false = never
 });
 
@@ -68,8 +71,21 @@ export const NET_DEFAULTS = Object.freeze({
  */
 export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate']);
 
+/**
+ * Account / social intents draw from a third, much smaller bucket (SOCIAL: socialPerSec 2/s, burst 10 — a normal UI
+ * pass of create → sync → request → accept → invite must fit). They are not expensive individually, but they are the
+ * endpoints a hostile client would hammer: account creation mints and hashes a key, friend/invite intents fan out
+ * pushes to *other* players' sockets, and share.link is a per-room-screen request. Throttling them here keeps a single
+ * socket from turning into a notification amplifier for a stranger.
+ */
+export const SOCIAL_TYPES = new Set([
+  'account.create', 'account.login', 'account.rename', 'account.rotate', 'account.logout',
+  'friend.request', 'friend.accept', 'friend.decline', 'friend.remove', 'friend.sync',
+  'invite.send', 'invite.accept', 'invite.decline', 'share.link',
+]);
+
 /** Close codes (see header). */
-export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, POLICY: 1008, SHUTDOWN: 1001 });
+export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, POLICY: 1008, SHUTDOWN: 1001, ROTATED: 4004 });
 
 const WS_OPEN = 1;
 const MAX_RID = 2 ** 31;
@@ -122,6 +138,24 @@ export class Session {
      * window). A solo run keeps its session resumable for the official `singleReconnectTime` (24 h) — see lobby.js.
      */
     this.resumeWindowMs = null;
+    /**
+     * @type {string | null} account this session is logged in as (DESIGN §27; lobby-owned). Null = a guest: it can play
+     * and chat but it has no friends, cannot be added and cannot invite. A resume keeps it (a reconnect never logs a
+     * player out), and `hello.key` may switch it (presenting a different account's key logs in as that account).
+     */
+    this.accountId = null;
+    /**
+     * @type {string | null} the canonical origin this session may hand out in share links (shared/origin.js): the
+     * reported `hello.origin` when the deployment allows it, else the origin of the connection itself, else null (the
+     * client then falls back to its own location.origin). Per-session on purpose — an origin is never broadcast.
+     */
+    this.shareOrigin = null;
+    /** @type {string | null} the reason the last `hello.key` was refused, echoed once in `welcome` (client prompts). */
+    this.accountError = null;
+    /** @type {number} consecutive failed key presentations (the lobby refuses to keep hashing after a few). */
+    this.authFails = 0;
+    /** @type {number} ms epoch the failure counter was last reset. */
+    this.authFailsAt = 0;
   }
 }
 
@@ -313,6 +347,25 @@ export function sendSession(session, msg) {
 const validRid = (rid) => Number.isInteger(rid) && rid >= 0 && rid <= MAX_RID;
 
 /**
+ * The `ok` reply of a request: `{ t: 'ok', rid }`, plus the handler's `payload` when it returned one (share.link's
+ * canonical link is the first user). `t` and `rid` are the frame's identity and can never be overridden by a payload.
+ * @param {number} rid @param {{ payload?: object } | undefined} res
+ */
+function okMsg(rid, res) {
+  const out = { t: 'ok', rid };
+  const payload = res && typeof res === 'object' ? res.payload : null;
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    // Never let a payload key shadow the frame identity, and never let one reach Object.prototype (`out[k] = v` with
+    // k = '__proto__' would be a prototype write). Today only share.link returns a payload, with fixed keys.
+    for (const [k, v] of Object.entries(payload)) {
+      if (k === 't' || k === 'rid' || k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/**
  * True for a real ERR code (own property; rejects inherited names like "constructor").
  * @param {unknown} code
  * @returns {boolean}
@@ -465,6 +518,49 @@ export function clientAddress(req, trustProxy = NET_DEFAULTS.trustProxy) {
   return { ip: peer, key: limitKeyOf(peer) };
 }
 
+/**
+ * The origin this WebSocket connection arrived on — what a share link handed to this player should point at
+ * (DESIGN §27.1, shared/origin.js).
+ *
+ * `Host` for a direct connection; when the peer is a trusted reverse proxy (the same rule as `clientAddress`: a
+ * loopback/private peer, or `trustProxy: true`), the `X-Forwarded-Host` / `X-Forwarded-Proto` it reports win, because
+ * that is the address the *player* used (a tunnel terminates TLS and forwards to localhost). The first token of a
+ * comma-separated forwarded header is the client-facing one.
+ *
+ * The result is only ever a hint for `pickShareOrigin`: that function compares it against the configured allowlist and
+ * the client's reported origin, so a spoofed Host can at worst name the attacker's own connection.
+ *
+ * @param {import('node:http').IncomingMessage | undefined} req
+ * @param {'auto' | boolean} [trustProxy]
+ * @returns {string | null}
+ */
+export function connectionOrigin(req, trustProxy = NET_DEFAULTS.trustProxy) {
+  if (!req || typeof req !== 'object') return null;
+  const headers = req.headers || {};
+  const peer = req.socket?.remoteAddress;
+  const trust = trustProxy === true || (trustProxy !== false && (!peer || isLocalIp(peer)));
+  let host = null;
+  let proto = null;
+  if (trust) {
+    const fwdHost = firstHeaderToken(headers['x-forwarded-host']);
+    const fwdProto = firstHeaderToken(headers['x-forwarded-proto']);
+    if (fwdHost) host = fwdHost.toLowerCase();
+    if (fwdProto) proto = fwdProto.toLowerCase();
+  }
+  if (!host) host = firstHeaderToken(headers.host);
+  if (!host) return null;
+  if (!proto) proto = req.socket?.encrypted ? 'https' : 'http';
+  return originFromHost(host, proto);
+}
+
+/** First comma-separated token of a header value (string or array), trimmed; null when absent/empty. */
+function firstHeaderToken(v) {
+  const s = Array.isArray(v) ? v[0] : v;
+  if (typeof s !== 'string') return null;
+  const first = s.split(',')[0].trim();
+  return first.length > 0 ? first : null;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Network: per-socket pipeline
 // ---------------------------------------------------------------------------------------------------
@@ -483,6 +579,9 @@ class Connection {
     this.session = null;
     this.bucket = new TokenBucket(opts.ratePerSec, opts.rateBurst, now);
     this.heavy = new TokenBucket(opts.heavyPerSec, opts.heavyBurst, now);
+    this.social = new TokenBucket(opts.socialPerSec, opts.socialBurst, now);
+    /** @type {string | null} canonical origin of the upgrade request (DESIGN §27.1; see connectionOrigin) */
+    this.origin = null;
     this.dropWindowAt = now;
     this.drops = 0;
     /** true once the server initiated the close; frames still in flight are ignored */
@@ -553,6 +652,7 @@ export class Network {
   handleConnection(ws, req) {
     if (this.closed) { try { ws.close(CLOSE.SHUTDOWN, 'server shutdown'); } catch { /* ignore */ } return; }
     const conn = new Connection(ws, clientAddress(req, this.opts.trustProxy), this.now(), this.opts);
+    conn.origin = connectionOrigin(req, this.opts.trustProxy);
     this.conns.set(ws, conn);
     if (conn.key) this.connsPerKey.set(conn.key, (this.connsPerKey.get(conn.key) || 0) + 1);
     ws.on('message', (data, isBinary) => {
@@ -608,6 +708,7 @@ export class Network {
     if (msg.t === 'hello') { this.onHelloMsg(conn, msg, now); return; }
     if (!conn.session) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'hello required')); return; }
     if (HEAVY_TYPES.has(msg.t) && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
+    if (SOCIAL_TYPES.has(msg.t) && !conn.social.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
 
     let res;
     try {
@@ -625,7 +726,7 @@ export class Network {
       // surface as an error toast in the browser)
       if (msg.t === 'b.progress' && !validRid(rid)) return;
       this.reply(conn, errorMsg(isErrCode(res.error) ? res.error : ERR.INTERNAL, rid, res.detail));
-    } else if (validRid(rid)) this.reply(conn, { t: 'ok', rid });
+    } else if (validRid(rid)) this.reply(conn, okMsg(rid, res));
   }
 
   /** @param {Connection} conn @param {any} msg @param {number} now */
@@ -660,8 +761,32 @@ export class Network {
     session.addr = conn.ip;
     session.limitKey = conn.key;
 
+    // Account binding (DESIGN §27): a presented key logs the session in — or switches it to another account. No key
+    // keeps whatever the session already had, so a plain token resume never logs a player out. The lobby owns the
+    // rules (an account name is authoritative over the title-screen nickname) and the failure throttle.
+    session.accountError = null;
+    if (msg.key != null || session.accountId) {
+      try {
+        // `msg.key == null` on a session that already holds an account: the lobby re-applies the account's own name
+        // before `welcome` is built, so a keyless resume cannot drift to the hello nickname.
+        const bound = this.handler.bindAccount?.(session, msg.key ?? null);
+        if (bound && bound.error) session.accountError = bound.error;
+      } catch (e) {
+        this.log.error('[net] bindAccount crashed', e);
+        session.accountError = ERR.INTERNAL;
+      }
+    }
+    // Share-link origin (DESIGN §27.1): the lobby validates the reported origin against the deployment's allowlist
+    // and the origin this very connection arrived on; null means "no server opinion" (client falls back to its own).
+    try {
+      session.shareOrigin = this.handler.resolveOrigin?.(session, msg.origin ?? null, conn.origin) ?? null;
+    } catch (e) {
+      this.log.error('[net] resolveOrigin crashed', e);
+      session.shareOrigin = null;
+    }
+
     let extra = null;
-    try { extra = this.handler.welcomeInfo?.() ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
+    try { extra = this.handler.welcomeInfo?.(session) ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
     const welcome = { ...(extra && typeof extra === 'object' ? extra : null), t: 'welcome', playerId: session.playerId, token: session.token, name: session.name, serverNow: now, version: PROTOCOL_VERSION, resumed };
     if (validRid(rid)) welcome.rid = rid;
     this.reply(conn, welcome);

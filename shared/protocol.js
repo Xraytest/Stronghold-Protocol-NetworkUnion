@@ -4,6 +4,8 @@
 import { DIFFICULTIES, NAME_MAX_LEN, ROOM_CODE_LEN, MAX_SEATS, EMOTES, GEO } from './constants.js';
 import { isDroppableChess } from './standIn.js';
 import { diySlotIds, validateDiyPicks } from './diy.js';
+import { canonicalKey } from './accountKey.js';
+import { canonicalOrigin, ORIGIN_MAX_LEN } from './origin.js';
 
 // ---- tiny validators -------------------------------------------------------
 const isInt = (v, lo = -Infinity, hi = Infinity) => Number.isInteger(v) && v >= lo && v <= hi;
@@ -24,6 +26,15 @@ const isMap = (v, max, key, val) => {
   return true;
 };
 const isList = (v, max, item) => Array.isArray(v) && v.length <= max && v.every(item);
+
+// ---- account & social fields (DESIGN §27) -------------------------------------------------------
+// A requested name arrives raw and is normalised server-side (shared/accountKey.js normalizeName): the validator only
+// bounds it so a huge string never reaches the store. A presented key must be well-formed — an unknown but well-formed
+// key is ACCOUNT_BAD_KEY (an auth answer), a malformed one never reaches the store at all. A reported origin must
+// already be canonical: the browser's `location.origin` always is, so anything else is a bug or an injection attempt.
+const isRawName = (v) => typeof v === 'string' && v.length > 0 && v.length <= 64 && v.trim().length > 0;
+const isKeyField = (v) => typeof v === 'string' && v.length > 0 && v.length <= 64 && canonicalKey(v) !== null;
+const isOriginField = (v) => typeof v === 'string' && v.length > 0 && v.length <= ORIGIN_MAX_LEN && canonicalOrigin(v) === v;
 
 // ---- client-side combat (DESIGN §14): b.progress / b.result payloads -------------------------------------------
 
@@ -318,9 +329,22 @@ const target = (v) => {
 /** @type {Record<string, Record<string, (v:any)=>boolean> & { $optional?: string[] }>} */
 export const C2S = {
   // session & lobby
-  hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6), $optional: ['token', 'version'] },
+  // key: the account credential (DESIGN §27) — the browser caches it and sends it with every hello, so a reconnect and
+  // a fresh tab are logged in before the first screen renders; an unknown key is answered with welcome.accountError
+  // (never by silently dropping the identity). origin: the address this tab actually reached the server by
+  // (`location.origin`), used only to canonicalise share links — see shared/origin.js for the trust rule.
+  hello: {
+    name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0,
+    token: (v) => v == null || isStr(v, 64),
+    version: (v) => v == null || isInt(v, 0, 1e6),
+    key: (v) => v == null || isKeyField(v),
+    origin: (v) => v == null || isOriginField(v),
+    $optional: ['token', 'version', 'key', 'origin'],
+  },
   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
-  'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v) },
+  // hidden: create the room without showing it to the creator's friends (their friend list shows the status as
+  // 'hidden'), while an explicit invite still works — the owner's requirement "创建对局时允许屏蔽好友"
+  'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v), hidden: optional(isBool), $optional: ['hidden'] },
   'room.join': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
   'room.leave': {},
   'room.ready': { ready: isBool },
@@ -344,6 +368,37 @@ export const C2S = {
   // room.closed { reason: 'kicked' }). room.leave / g.leave leave a spectator seat like a player seat.
   'room.spectate': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
   'room.removeSpectator': { playerId: isId },
+
+  // accounts & friends (DESIGN §27). The account layer exists so a public deployment can offer identity without
+  // passwords: `account.create` mints a 160-bit key and returns it exactly once, `account.login` proves the key, and
+  // everything social hangs off the account id, never off a session's per-connection playerId.
+  'account.create': { name: isRawName },
+  'account.login': { key: isKeyField },
+  'account.rename': { name: isRawName },
+  // mint a fresh key for this account and drop every OTHER live session of it (the old key stops working immediately;
+  // the caller keeps its session and is handed the new key) — the "my key leaked" button
+  'account.rotate': {},
+  // stop using this account in this session (the key is NOT invalidated: the account can be logged into again here or
+  // anywhere else). Friends see the account go offline. The client clears its cached key at the same time.
+  'account.logout': {},
+  // friend.pair keys on the account id. request is refused unless the two accounts played a match together
+  // (NOT_ELIGIBLE) — there is deliberately no search / add-by-name / add-by-id channel: the met list is the only door.
+  'friend.request': { accountId: isId },
+  'friend.accept': { accountId: isId },
+  'friend.decline': { accountId: isId },
+  'friend.remove': { accountId: isId },
+  // resend the whole social snapshot (friends + requests + met + invites) — the client asks once after login/hello
+  'friend.sync': {},
+  // quick invite: ask the server to deliver an invitation to the room this session is in to one friend
+  'invite.send': { accountId: isId },
+  // answer a received invite by its server-minted id (never by room code): accepting joins the room through the same
+  // gates as room.join (lobby / free seat / not started), so an invite cannot bypass a room's rules
+  'invite.accept': { inviteId: isId },
+  'invite.decline': { inviteId: isId },
+  // the canonical share link of this session's room (server/accounts.js + shared/origin.js): answered with
+  // { origin, url, source } — `source` says whether the origin came from the configured allowlist, the connection, or
+  // is absent (the client then builds the link from its own location.origin, which is always correct)
+  'share.link': {},
 
   // match
   'g.infoReady': {},
@@ -398,6 +453,10 @@ export const S2C = [
   'welcome', 'ok', 'error', 'pong',
   'room.state', 'room.closed',
   'm.public', 'm.private', 'm.field', 'm.toast', 'm.ticker', 'm.emote', 'm.result',
+  // account & friends (DESIGN §27). `account.state` { account, key?, error? } is pushed after hello/login/create and
+  // carries the freshly minted key exactly once (create / rotate). `friend.state` is the whole snapshot; the
+  // `friend.request` / `friend.update` / `friend.remove` / `invite` / `invite.done` pushes are the increments.
+  'account.state', 'friend.state', 'friend.request', 'friend.update', 'friend.remove', 'invite', 'invite.done',
   // m.unitStats { seq, round, units: [unitStatsEntry] } — the answer to g.unitStats (the requester only)
   'm.unitStats',
   // client-side combat (DESIGN §14): b.start { battleId, fieldId, kind, spec, authoritative, startAt, serverNow, elapsed,

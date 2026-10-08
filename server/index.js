@@ -24,7 +24,7 @@
 
 import http from 'node:http';
 import { getData, loadData } from './data.js';
-import { ROOT, listenAddress, serveDirs, makeLogger, parseTrustProxy } from './http/config.js';
+import { ROOT, listenAddress, serveDirs, makeLogger, parseTrustProxy, defaultAccountsFile } from './http/config.js';
 import { WS_MAX_PAYLOAD, createSessionStack, attachWebSocket } from './http/websocket.js';
 import { DATA_SHIM_JS, createStaticHandler } from './http/static.js';
 import { createPackRegistry } from './packs.js';
@@ -37,7 +37,7 @@ import { lanUrls, isProcessEntry, runMain } from './http/boot.js';
 // The public API of this module (tests and tools import it from here); the code lives in ./http/.
 export {
   ROOT, WS_MAX_PAYLOAD, DATA_SHIM_JS, MIME, COMPRESSIBLE, BUILD_INPUTS, computeBuildTag, buildTag, resetBuildTag,
-  acceptsGzip, parseRange, createStaticHandler, lanUrls, parseTrustProxy,
+  acceptsGzip, parseRange, createStaticHandler, lanUrls, parseTrustProxy, defaultAccountsFile,
 };
 
 /**
@@ -63,7 +63,7 @@ export async function startServer(opts = {}) {
 
   // The process-wide singleton serves the default data dir; a custom dir (tests) gets its own copy.
   const data = opts.dataDir ? loadData(dataDir, { log }) : getData({ dir: dataDir, log });
-  const { registry, lobby, network } = createSessionStack(opts, { data, log });
+  const { registry, lobby, network, accounts } = createSessionStack(opts, { data, log });
   // content packs (docs/PACKS.md): scanned now — the start log names them — and again whenever their folders change
   const packs = createPackRegistry({ publicDir, dataDir, packsDir }, { log });
   packs.refresh(true);
@@ -101,6 +101,8 @@ export async function startServer(opts = {}) {
     closing = (async () => {
       try { lobby.shutdown('shutdown'); } catch (e) { log.error('[shutdown] lobby', e); }
       network.close();
+      // the account file is the one thing worth flushing: sessions and rooms are gone by design (accounts survive)
+      try { await accounts.flush(); } catch (e) { log.error('[shutdown] accounts', e); }
       await new Promise((resolve) => {
         server.close(() => resolve());
         server.closeIdleConnections?.();
@@ -111,8 +113,10 @@ export async function startServer(opts = {}) {
     return closing;
   }
 
-  return { port: actualPort, host, url, server, wss, lobby, network, registry, packs, close };
+  return { port: actualPort, host, url, server, wss, lobby, network, registry, accounts, packs, close };
 }
 
 // `node server/index.js` / npm start: listen, print the banner, stop on SIGINT / SIGTERM (http/boot.js).
-if (isProcessEntry(import.meta.url)) runMain(startServer);
+// The CLI is where the account file becomes persistent: `state/accounts.json` (SP_ACCOUNTS_FILE overrides, `off`
+// disables). A programmatic startServer() stays in memory unless it is given `accountsFile` — which is what tests want.
+if (isProcessEntry(import.meta.url)) runMain(() => startServer({ accountsFile: defaultAccountsFile() }));

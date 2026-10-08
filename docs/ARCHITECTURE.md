@@ -3,7 +3,8 @@
 For a newcomer who wants to find their way before changing something. This file only maps the code. The contracts are
 in the design document — [DESIGN.md](DESIGN.md) is its index, the current rules are in `docs/design/` (§5 the battle
 engine: [design/engine.md](design/engine.md); §6 the match: [design/match.md](design/match.md); §8 the protocol and §14
-client-side combat: [design/network.md](design/network.md); §9 rendering: [design/client.md](design/client.md)), the
+client-side combat: [design/network.md](design/network.md); §9 rendering: [design/client.md](design/client.md); §27
+accounts, friends and quick invites: [design/social.md](design/social.md)), the
 per-release revisions and their evidence in `docs/history/`;
 the details in [SIM.md](SIM.md) (battle engine, hooks, SkillSpec), [META.md](META.md) (match engine, prep-phase
 effects), [DATA.md](DATA.md) (generated data), [ASSETS.md](ASSETS.md) (art and audio) and [I18N.md](I18N.md)
@@ -45,11 +46,13 @@ Every frame is JSON text, `{ t, rid?, …fields }`.
 
 | direction | messages | handled in |
 |---|---|---|
-| client → server | `hello` (name, reconnect token) → `welcome`; `ping` → `pong` | `server/net.js` |
+| client → server | `hello` (name, reconnect token, account key, reported origin) → `welcome`; `ping` → `pong` | `server/net.js` |
 | | `room.*`: create, join, ready, difficulty, AI seats, kick, start, the 干员调配 loadout, 干员持有 ownership, 自选编队 picks, spectating | `server/lobby.js` |
+| | `account.*`: create, login, rename, rotate, logout; `friend.*`: request, accept, decline, remove, sync; `invite.*`: send, accept, decline; `share.link` | `server/lobby.js` → `server/accounts.js` |
 | | `g.*`: match intents — buy, refresh, freeze, level up, sell, move, equip, Arts, rewards, 机变 choices, ready, emotes, watching, pause … | `server/match/match/intents.js` → `server/match/player/` |
 | | `b.progress`, `b.result`: the battle reports of the authoritative browser | `server/match/match/reports.js` |
 | server → client | `room.state`, `room.closed` | `server/lobby.js` |
+| | `account.state`, `friend.state`, `friend.request`, `friend.update`, `friend.remove`, `invite`, `invite.done` | `server/lobby.js` |
 | | `m.public` (what every player sees), `m.private` (one player's shop, hand, funds …), `m.field`, `m.toast`, `m.ticker`, `m.emote`, `m.unitStats`, `m.result` | `server/match/match/views.js`, `server/match/player/views.js` |
 | | `b.start` (a BattleSpec), `b.pool` (the shared leader HP), `b.end`; `b.snap` / `b.ev` only in the server-run mode | `server/match/match/clientCombat.js` |
 
@@ -75,7 +78,8 @@ so old imports keep working: `public/js/ui/gameLogic.js` (`public/js/ui/gameLogi
 | `server/index.js` | the process entry (`npm start`); `startServer()` wires `server/http/` |
 | `server/http/` | `config.js` (environment), `websocket.js` (sessions, `/ws`), `static.js` (the mounts), `media.js`, `files.js` (MIME, gzip, ETag, ranges), `buildTag.js`, `routes.js` (`/healthz`), `common.js`, `boot.js` (a pending update package first, banner, shutdown) |
 | `server/net.js` | sessions and reconnect tokens, rate limits, message validation |
-| `server/lobby.js` | rooms, seats, AI seats, spectators; starts a `Match` |
+| `server/accounts.js` | the account layer that survives a restart (DESIGN §27): 160-bit keys and their peppered SHA-256 digests, the "played together" ledger (the only door to a friend request), the friend graph and quick invites; in memory unless a file is configured, atomic 0600 persistence |
+| `server/lobby.js` | rooms, seats, AI seats, spectators; starts a `Match`; binds an account key to a session, derives friend presence from its rooms and answers share links |
 | `server/data.js` | loads `data/*.json` once (frozen) |
 | `server/packs.js` | the content packs (PACKS.md): finds the language packs of `public/i18n/` and the pack folders of `packs/`, validates them, answers `/packs/index.json` and which pack files may be served; re-reads the folders when they change |
 | `server/update.js` | the update package on the player's machine (DEPLOY.md §1.5): before the server starts, an extracted `UPDATE.json` is finished — the install verified against `MANIFEST.json`, the files the new version dropped deleted, or the start refused when the install is another version; doctor's `MANIFEST.json` check |
@@ -90,19 +94,19 @@ so old imports keep working: `public/js/ui/gameLogic.js` (`public/js/ui/gameLogi
 | `server/sim/content/garrisons/`, `items/`, `bands/` | 特质, equipment and strategies: `battle.js` is the battle side, `meta.js` the prep side (`registerMeta`, META §2) |
 | `server/sim/content/bonds/` | the 23 bonds: `core.js` the 8 core bonds (both sides), `server/sim/content/bonds/addon/` the 15 add-on bonds (`battle.js`, `meta.js`) |
 | `server/sim/content/` (the rest) | `tokens.js` (summons), `devices.js` (terrain and stage devices), `generic.js` (the kit built from a skill's data when a chess has none), `choices.js` (机变 cards in battle) |
-| `shared/` | imported by the server and the browser: `protocol.js`, `constants.js`, `i18n.js`, `i18nData.js` and `i18nPacks.js` (languages), `packs.js` (the content-pack format), `standIn.js` (补位), `diy.js` (自选编队), `highGround.js`, `loadoutRecord.js` |
+| `shared/` | imported by the server and the browser: `protocol.js`, `constants.js`, `i18n.js`, `i18nData.js` and `i18nPacks.js` (languages), `packs.js` (the content-pack format), `standIn.js` (补位), `diy.js` (自选编队), `highGround.js`, `loadoutRecord.js`, `accountKey.js` (the account key format and name normalisation, DESIGN §27) and `origin.js` (canonical share-link origins, §27.1) |
 
 ### Client (`public/`)
 
 | path | what |
 |---|---|
 | `public/index.html`, `public/js/main.js` | the page and its entry: boot, the router (title → lobby → room → game) |
-| `public/js/net.js`, `public/js/store.js`, `public/js/data.js` | the socket client, the observable store, the data loader (`/data/*.json`, with the English overlay) |
+| `public/js/net.js`, `public/js/store.js`, `public/js/data.js`, `public/js/account.js` | the socket client (it reports the account key and the page origin in `hello`), the observable store (the `account` slice), the data loader (`/data/*.json`, with the English overlay), and the account layer: the cached key, the friends/invites requests and their pushes |
 | `public/js/battle/` | `runner.js` (the local battle: loads `/sim/`, steps it, reports), `observe.js` (who may watch which field) |
 | `public/js/screens/` | `title.js`, `lobby.js`, `room.js`, `loadout.js` (干员调配), `ownership.js` (干员持有), `diy.js` (自选编队), `briefing.js`, `bandDraft.js`, `game.js` with `public/js/screens/game/`, `result.js` |
-| `public/js/ui/` | the HUD components (`hud.js`, `shopBar.js`, `detailPanel.js`, `bondStrip.js`, `teamPanel.js` …); `public/js/ui/gameLogic/` the pure in-match logic, unit-tested in Node |
+| `public/js/ui/` | the HUD components (`hud.js`, `shopBar.js`, `detailPanel.js`, `bondStrip.js`, `teamPanel.js` …); `public/js/ui/gameLogic/` the pure in-match logic, unit-tested in Node; `public/js/ui/friends.js` the account UI (the key dialog, the friends panel and button, the invite popup, DESIGN §27) |
 | `public/js/render/` | the field view: `app.js` with `public/js/render/app/`, `units.js` and `spine.js` (models), `tiles.js`, `projection.js`, `interp.js`, `pick.js`, `drag.js`, `public/js/render/fx/` (effects; `kinds.js` maps the fx kinds), `public/js/render/board3d/` (the official 3D board) |
-| `public/css/`, `public/i18n/<code>.json` | the styles; the UI strings of each language pack (English ships) |
+| `public/css/`, `public/i18n/<code>.json` | the styles (`theme.css`, `components.css`, `devices.css`, `emotes.css`, `social.css`); the UI strings of each language pack (English ships) |
 
 ### Data, tools, tests
 
@@ -111,7 +115,7 @@ so old imports keep working: `public/js/ui/gameLogic.js` (`public/js/ui/gameLogi
 | `data/*.json` | generated by `tools/build-data.mjs` and committed — never edited by hand (DATA.md); `data/backups.json` holds the 补位 and 自选 data, `data/i18n/<code>.json` the game texts of a language pack (English), `data/assets.json` the art manifest |
 | `packs/` | content packs installed as folders, `packs/<id>/pack.json` + files (PACKS.md); empty in the repository but for its readme |
 | `tools/` | `build-data.mjs`, `build-i18n.mjs`, `i18n.mjs` (UI strings, language packs), `packs.mjs` (content packs), `setup.mjs` / `fetch-assets.mjs` / `tools/assets/` (art and audio), `tools/local-extract/` (art from a local game client), `vendor.mjs`, `golden.mjs`, `check-imports.mjs`, `package.mjs` / `package-update.mjs` (the release zips, the update package), `doctor.mjs`; sweeps: `matchrun.mjs`, `simrun.mjs`, `botbench.mjs`, `balance.mjs` |
-| `test/` | `node:test` suites by area: `test/content/` (kits, enemies, bonds, items), `test/sim/` (the engine), `test/match/` (match engine, bots), `test/ui/`, `test/render/`, `test/golden/` (the stored digests), `test/helpers/` (`battleHarness.js`; `designDocs.js`, the design document in § order for the doc tests), `test/e2e/` (browser and bot runs) |
+| `test/` | `node:test` suites by area: `test/content/` (kits, enemies, bonds, items), `test/sim/` (the engine), `test/match/` (match engine, bots), `test/ui/`, `test/render/`, `test/golden/` (the stored digests), `test/helpers/` (`battleHarness.js`; `designDocs.js`, the design document in § order for the doc tests), `test/e2e/` (`coop.e2e.mjs` — a whole real match; `social.e2e.mjs` — the DESIGN §27 account, friend and quick-invite flow in two real browsers; both need Chrome and are not part of `node --test`), `test/accounts.test.js`, `test/friends.test.js`, `test/social-security.test.js` and `test/share-origin.test.js` (the DESIGN §27 account, friend, invite and share-link suites, the adversarial ones included) |
 | `types/` | JSDoc typedefs of the type-checked slice (`types/README.md`) |
 | `docs/` | the documents; `docs/DESIGN.md` the index of the design document, `docs/design/` its current rules, `docs/history/` its per-release revisions; `docs/research/` the research on the official mode |
 
@@ -181,6 +185,7 @@ public/assets/ ─────────▶ public/js/render/, public/js/audio
 | phases, timers, 联防, the Final Assault | `server/match/match/phases.js`, `server/match/match/unitePhase.js`, `server/match/match/bossRounds.js`, `server/match/unite.js`, `server/match/finalAssault.js` | META.md §1, §4 |
 | the bots | `server/match/bot.js` | `tools/botbench.mjs` |
 | a new client message | `shared/protocol.js` (`C2S`), then `server/match/match/intents.js` (or `server/lobby.js` for `room.*`) | DESIGN §8 |
+| accounts, friends, quick invites, share links | `server/accounts.js`, `server/lobby.js`, `shared/accountKey.js`, `shared/origin.js`, `public/js/account.js` | DESIGN §27 ([design/social.md](design/social.md)) |
 | data from the official tables | `tools/build-data.mjs` | rebuild `--offline`, JSON compare, DATA.md, golden |
 | a screen or a HUD panel | `public/js/screens/`, `public/js/ui/`; pure logic in `public/js/ui/gameLogic/` | `test/ui/` |
 | battle visuals | `public/js/render/fx/kinds.js`, `public/js/render/units.js`, `public/js/render/spine.js` | `test/render/` |

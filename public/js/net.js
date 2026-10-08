@@ -31,6 +31,7 @@
 
 import { PROTOCOL_VERSION, ERR_TEXT } from '../../shared/constants.js';
 import { validateC2S } from '../../shared/protocol.js';
+import { ORIGIN_MAX_LEN } from '../../shared/origin.js';
 import { N_ } from '../../shared/i18n.js';
 
 export const REQUEST_TIMEOUT_MS = 8000;
@@ -46,6 +47,7 @@ export const CLIENT_ERR_TEXT = Object.freeze({
   DISCONNECTED: N_('连接已断开，请重试'),
   CLOSED: N_('连接已关闭'),
   REPLACED: N_('该身份已在其他页面登录'),
+  ROTATED: N_('账号密钥已在其他页面更换，本页需要重新登录'),
   VERSION: N_('客户端版本与服务器不一致，请刷新页面'),
 });
 
@@ -53,6 +55,11 @@ export const CLIENT_ERR_TEXT = Object.freeze({
 export const CLOSE_REPLACED = 4001;
 /** Server close code: the socket never sent `hello` (server/net.js CLOSE.HELLO_TIMEOUT, ~30–60 s). */
 export const CLOSE_HELLO_TIMEOUT = 4002;
+/**
+ * Server close code 4004 (server/net.js CLOSE.ROTATED): this account's key was rotated from another session, so the
+ * key this tab holds is dead. The client clears the cached key and tells the player (public/js/account.js).
+ */
+export const CLOSE_ROTATED = 4004;
 /** A pre-hello socket must have lived this long before a 4002 close is swapped quietly (no loop). */
 const QUIET_SWAP_MIN_AGE_MS = 5000;
 
@@ -114,6 +121,7 @@ export class Net {
    * @param {string} [opts.url] socket URL (default: derived from location at connect time)
    * @param {any} [opts.WebSocket] WebSocket constructor (default: globalThis.WebSocket)
    * @param {() => (string|null)} [opts.getToken] reconnect-token provider for `hello`
+   * @param {() => (string|null)} [opts.getKey] account-key provider for `hello` (DESIGN §27)
    * @param {() => number} [opts.now]
    * @param {() => number} [opts.random]
    * @param {{setTimeout: Function, clearTimeout: Function, setInterval: Function, clearInterval: Function}} [opts.timers]
@@ -122,6 +130,7 @@ export class Net {
     this.url = opts.url || null;
     this.WS = opts.WebSocket || null;
     this.getToken = typeof opts.getToken === 'function' ? opts.getToken : () => null;
+    this.getKey = typeof opts.getKey === 'function' ? opts.getKey : () => null;
     this.now = opts.now || (() => Date.now());
     this.random = opts.random || Math.random;
     this.timers = opts.timers || {
@@ -314,6 +323,16 @@ export class Net {
       this._emit('replaced', this.lastError);
       return;
     }
+    if (ev && ev.code === CLOSE_ROTATED) {
+      // The account key was rotated elsewhere: this tab's key is dead, so a reconnect would only fail again. Stop,
+      // tell the UI (public/js/account.js clears the cached key), and let the player log in with the new one.
+      this._manualClose = true;
+      this._failPending('ROTATED', true);
+      this.lastError = new NetError('ROTATED');
+      this._setStatus('closed');
+      this._emit('rotated', this.lastError);
+      return;
+    }
     if (ev && ev.code === CLOSE_HELLO_TIMEOUT && !this.name && this.status === 'connected'
         && this.now() - this._openedAt >= QUIET_SWAP_MIN_AGE_MS) {
       // Idle pre-hello socket dropped by the server: replace it without a visible status change.
@@ -366,6 +385,15 @@ export class Net {
     let token = null;
     try { token = this.getToken(); } catch { token = null; }
     if (typeof token === 'string' && token.length > 0 && token.length <= 64) msg.token = token;
+    // Account key (DESIGN §27): the tab's saved key logs this session in; the server answers with `welcome.account`
+    // (or `welcome.accountError` when the key is unknown). ALWAYS sent on every hello, so a reconnect keeps the login.
+    let key;
+    try { key = this.getKey ? this.getKey() : null; } catch { key = null; }
+    if (typeof key === 'string' && key.length > 0 && key.length <= 64) msg.key = key;
+    // The origin this page was loaded from. The server canonicalises it and answers `welcome.shareOrigin` only when it
+    // matches the deployment's allowlist (SP_PUBLIC_ORIGINS) or this very connection — the anti-rogue-tunnel rule.
+    const origin = globalThis.location && globalThis.location.origin;
+    if (typeof origin === 'string' && origin.length > 0 && origin.length <= ORIGIN_MAX_LEN) msg.origin = origin;
     this._helloRid = rid;
     this._helloSentName = this.name;
     if (this.status !== 'handshaking') this._setStatus('handshaking');
@@ -392,10 +420,15 @@ export class Net {
     this.playerId = msg.playerId ?? null;
     this.attempt = 0;
     this.lastError = null;
+    // The account this session is logged in as (or null) and the share-link origin the server vouched for.
+    this.account = msg.account && typeof msg.account === 'object' ? msg.account : null;
+    this.accountError = typeof msg.accountError === 'string' ? msg.accountError : null;
+    this.shareOrigin = typeof msg.shareOrigin === 'string' ? msg.shareOrigin : null;
     if (Number.isFinite(msg.serverNow)) this._addClockSample(msg.serverNow + (this.ping ?? 0) / 2 - this.now(), Infinity);
     this._setStatus('online');
     this._flushQueue();
     this._sendPing();
+    this._emit('welcome', msg);
   }
 
   _onHelloError(msg) {

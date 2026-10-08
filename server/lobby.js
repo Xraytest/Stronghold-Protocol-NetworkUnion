@@ -101,6 +101,7 @@ import { encode, isDroppable, isErrCode, sendRaw, sendSession } from './net.js';
 import { getData as defaultGetData, lookup } from './data.js';
 import { Match as DefaultMatch } from './match/Match.js';
 import { KITTED_CHARS } from './sim/content/kits/index.js';
+import { canonicalOrigin, parseOriginList, pickShareOrigin } from '../shared/origin.js';
 
 /** Room code alphabet: uppercase letters without I and O (and no digits, so no 0/1). */
 export const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -113,6 +114,11 @@ export const LOBBY_DEFAULTS = Object.freeze({
   maxMatchesPerAddr: 8,   // matches started from one client network that may run at once (0 = unlimited)
   resyncMinGapMs: 1000,   // heavy resyncs (match state / result replay) per session at most this often on repeated hellos
   soloReconnectWindowMs: null, // a dropped solo run stays resumable this long (null = data singleReconnectTime, 24 h)
+  publicOrigins: '',      // SP_PUBLIC_ORIGINS: pinned share-link origins (comma separated; EXCLUSIVE when set)
+  shareLink: true,        // SP_SHARE_LINK=0: never answer share.link (the client uses its own location.origin)
+  friendPushMs: 1000,     // at most one friend-presence push per account per this interval (coalesced)
+  maxJoinFails: 12,       // invalid room codes one session may try per window before RATE
+  joinFailWindowMs: 60_000,
 });
 
 /** Official `singleReconnectTime` (s) when the data lacks it (constData, research 01 §1). */
@@ -175,6 +181,11 @@ export class Room {
     this.ownerKey = null;
     /** @type {string | null} per-network limit key of whoever started the running match */
     this.matchKey = null;
+    /**
+     * @type {boolean} 屏蔽好友 (DESIGN §27): the room is not shown in the creator's friends' presence lists — they see
+     * only 'hidden'. An explicit invite still works (a deliberate act, not a broadcast). Set at creation.
+     */
+    this.hideFromFriends = false;
     this.createdAt = now;
     this.disposed = false;
   }
@@ -224,7 +235,7 @@ export class Lobby {
    *   options?: Partial<typeof LOBBY_DEFAULTS>,
    * }} opts
    */
-  constructor({ registry, log = noopLog, MatchClass = DefaultMatch, getData = defaultGetData, now = Date.now, seedFn, options = {} }) {
+  constructor({ registry, log = noopLog, MatchClass = DefaultMatch, getData = defaultGetData, now = Date.now, seedFn, accounts = null, options = {} }) {
     this.registry = registry;
     this.log = log;
     this.MatchClass = MatchClass;
@@ -232,6 +243,25 @@ export class Lobby {
     this.now = now;
     this.seedFn = seedFn || (() => randomInt(2 ** 32));
     this.opts = { ...LOBBY_DEFAULTS, ...options };
+    /**
+     * @type {import('./accounts.js').AccountStore | null} the account layer (DESIGN §27). null disables accounts,
+     * friends and invites entirely: every social intent then answers ACCOUNT_REQUIRED and the room/lobby behave
+     * exactly as before — which is what a deployment that does not want identity at all can choose.
+     */
+    this.accounts = accounts || null;
+    /** @type {string[]} pinned share-link origins (SP_PUBLIC_ORIGINS); EXCLUSIVE when non-empty (shared/origin.js). */
+    const allow = parseOriginList(this.opts.publicOrigins);
+    this.shareOrigins = allow.origins;
+    if (allow.invalid.length) this.log.warn(`[lobby] ignoring invalid SP_PUBLIC_ORIGINS entr${allow.invalid.length === 1 ? 'y' : 'ies'}: ${allow.invalid.join(', ')}`);
+    if (this.shareOrigins.length) this.log.info(`[lobby] share links pinned to ${this.shareOrigins.join(', ')}`);
+    /** @type {Map<string, NodeJS.Timeout>} coalesced friend-presence pushes by account id */
+    this.friendPushTimers = new Map();
+    /** @type {Map<string, number>} last friend-presence push per account id */
+    this.friendPushAt = new Map();
+    /** @type {Map<string, { n: number, at: number }>} invalid room-code attempts per playerId (brute-force guard) */
+    this.joinFails = new Map();
+    /** @type {Map<string, string>} last presence frame pushed per account (content dedupe) */
+    this.presenceFrames = new Map();
     /** @type {Map<string, Room>} */
     this.rooms = new Map();
     /** @type {Map<string, NodeJS.Timeout>} lobby grace timers by playerId */
@@ -269,6 +299,17 @@ export class Lobby {
    * @param {{ resumed: boolean, repeat: boolean }} info
    */
   onHello(session, { resumed, repeat }) {
+    // Accounts & friends (DESIGN §27): an account that comes online must reach its friends. A resume or a repeat hello
+    // also resyncs the social snapshot, so a client that was away for a while (and missed friend.update / invite
+    // frames) is correct again. A brand-new session that logged in through `hello.key` (a fresh tab with the cached
+    // key) is online too — without this its friends would keep seeing it offline until it touched a room.
+    if (session.accountId) {
+      // the account name is authoritative: a keyless resume must not show an arbitrary hello nickname next to an id
+      const account = this.accounts.get(session.accountId);
+      if (account) session.name = account.name;
+      if (resumed || repeat) this.sendFriendState(session);
+      this.notifyFriends(session.accountId, true);
+    }
     if (!resumed && !repeat) return;
     const room = this.roomOf(session);
     if (!room) {
@@ -320,6 +361,21 @@ export class Lobby {
       case 'room.diy': return this.diy(session, msg);
       case 'room.spectate': return this.spectate(session, msg);
       case 'room.removeSpectator': return this.removeSpectator(session, msg);
+      // accounts & friends (DESIGN §27)
+      case 'account.create': return this.accountCreate(session, msg);
+      case 'account.login': return this.accountLogin(session, msg);
+      case 'account.rename': return this.accountRename(session, msg);
+      case 'account.rotate': return this.accountRotate(session);
+      case 'account.logout': return this.accountLogout(session);
+      case 'friend.request': return this.friendRequest(session, msg);
+      case 'friend.accept': return this.friendAccept(session, msg);
+      case 'friend.decline': return this.friendDecline(session, msg);
+      case 'friend.remove': return this.friendRemove(session, msg);
+      case 'friend.sync': return this.friendSync(session);
+      case 'invite.send': return this.inviteSend(session, msg);
+      case 'invite.accept': return this.inviteAccept(session, msg);
+      case 'invite.decline': return this.inviteDecline(session, msg);
+      case 'share.link': return this.shareLink(session);
       default:
         if (typeof msg.t === 'string' && msg.t.startsWith('g.')) return this.routeGame(session, msg);
         return fail(ERR.BAD_MSG, `unhandled type ${String(msg.t).slice(0, 32)}`);
@@ -332,6 +388,8 @@ export class Lobby {
     const room = this.roomOf(session);
     // a solo run may be resumed within singleReconnectTime (24 h); everything else keeps the registry's window
     session.resumeWindowMs = room && room.match && room.mode === 'solo' ? this.soloResumeWindowMs() : null;
+    // friends see the account go offline (coalesced; a room-less player has no state broadcast to piggyback on)
+    if (session.accountId) this.notifyFriends(session.accountId);
     if (!room) return;
     const player = room.seatOf(session.playerId);
     const seat = player || room.spectatorOf(session.playerId);
@@ -362,13 +420,17 @@ export class Lobby {
     this.graceTimers.clear();
     for (const t of this.resyncTimers.values()) clearTimeout(t);
     this.resyncTimers.clear();
+    for (const t of this.friendPushTimers.values()) clearTimeout(t);
+    this.friendPushTimers.clear();
+    this.joinFails.clear();
+    this.presenceFrames.clear();
   }
 
   // ---------------------------------------------------------------------------------------------------
   // room.* handlers
   // ---------------------------------------------------------------------------------------------------
 
-  create(session, { mode, difficulty }) {
+  create(session, { mode, difficulty, hidden }) {
     const cur = this.roomOf(session);
     if (cur && cur.match) return fail(ERR.ROOM_STARTED, 'leave your running match first');
     if (this.rooms.size >= this.opts.maxRooms) return fail(ERR.INTERNAL, 'too many rooms');
@@ -386,21 +448,31 @@ export class Lobby {
     if (cur) this.removeMember(cur, session.playerId);
     const room = new Room(code, mode, difficulty, this.now());
     room.ownerKey = key;
+    // 屏蔽好友 (the owner's requirement): the room is not shown in the creator's friends' lists — an explicit invite
+    // still works, because that is a deliberate act rather than a broadcasting one
+    room.hideFromFriends = !!hidden;
     room.seats[0] = this.humanSeat(0, session);
     room.hostId = session.playerId;
     this.rooms.set(code, room);
     session.roomCode = code;
     session.notice = null;
     session.pendingResult = null;
-    this.log.info(`[lobby] ${code} created (${mode}/${difficulty}) by ${session.name}`);
+    this.log.info(`[lobby] ${code} created (${mode}/${difficulty}) by ${session.name}${hidden ? ' [hidden from friends]' : ''}`);
     this.broadcastState(room);
+    this.notifyFriends(session.accountId);
     return OK;
   }
 
   join(session, { code }) {
     const norm = String(code).trim().toUpperCase();
     const room = norm.length === ROOM_CODE_LEN ? this.rooms.get(norm) : undefined;
-    if (!room) return fail(ERR.ROOM_NOT_FOUND);
+    if (!room) {
+      // Brute-force guard (DESIGN §27.1): a 4-letter code is short, so a failed join is counted per session; past the
+      // window's budget the answer is RATE instead of ROOM_NOT_FOUND, which makes enumerating the code space useless.
+      if (this.joinFailTooMany(session)) return fail(ERR.RATE, 'too many invalid alliance keys');
+      return fail(ERR.ROOM_NOT_FOUND);
+    }
+    this.clearJoinFails(session.playerId);
     const cur = this.roomOf(session);
     // idempotent for members; a spectator of this room goes on below: it may take a free player seat (header)
     if (cur === room && !room.spectatorOf(session.playerId)) { this.sendState(room, session); return OK; }
@@ -416,7 +488,37 @@ export class Lobby {
     session.pendingResult = null;
     if (!room.hostId) room.hostId = session.playerId;
     this.broadcastState(room);
+    this.notifyFriends(session.accountId);
     return OK;
+  }
+
+  /**
+   * Count a failed room-code attempt; true when the session has burnt its budget for the window.
+   * @param {import('./net.js').Session} session @returns {boolean}
+   */
+  joinFailTooMany(session) {
+    const now = this.now();
+    const cur = this.joinFails.get(session.playerId);
+    if (!cur || now - cur.at > this.opts.joinFailWindowMs) {
+      this.joinFails.set(session.playerId, { n: 1, at: now });
+      this.trimJoinFails(now);
+      return this.opts.maxJoinFails <= 0;
+    }
+    cur.n++;
+    return cur.n > this.opts.maxJoinFails;
+  }
+
+  clearJoinFails(playerId) {
+    if (this.joinFails.delete(playerId) && this.joinFails.size > 4096) this.trimJoinFails(this.now());
+  }
+
+  trimJoinFails(now) {
+    if (this.joinFails.size < 4096) return;
+    for (const [id, e] of this.joinFails) if (now - e.at > this.opts.joinFailWindowMs) this.joinFails.delete(id);
+    if (this.joinFails.size >= 4096) {
+      const old = [...this.joinFails.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, 2048).map(([k]) => k);
+      for (const k of old) this.joinFails.delete(k);
+    }
   }
 
   leave(session) {
@@ -433,7 +535,12 @@ export class Lobby {
   spectate(session, { code }) {
     const norm = String(code).trim().toUpperCase();
     const room = norm.length === ROOM_CODE_LEN ? this.rooms.get(norm) : undefined;
-    if (!room) return fail(ERR.ROOM_NOT_FOUND);
+    if (!room) {
+      // same brute-force guard as `join`: spectating must not be a cheaper oracle for the 4-letter code space
+      if (this.joinFailTooMany(session)) return fail(ERR.RATE, 'too many invalid alliance keys');
+      return fail(ERR.ROOM_NOT_FOUND);
+    }
+    this.clearJoinFails(session.playerId);
     const cur = this.roomOf(session);
     if (cur === room) {
       if (!room.spectatorOf(session.playerId)) return fail(ERR.ALREADY, 'seated as a player');
@@ -641,8 +748,474 @@ export class Lobby {
   }
 
   /** Extra fields of every `welcome` (net.js): the operators a 自选 slot may field (shared/diy.js `kitted`). */
-  welcomeInfo() {
-    return { diyKitted: KITTED_CHARS };
+  welcomeInfo(session) {
+    return {
+      diyKitted: KITTED_CHARS,
+      // share-link origin for this connection only (DESIGN §27.1) — never broadcast, never another player's
+      shareOrigin: session ? session.shareOrigin : null,
+      // the account this session is logged in as (so the title screen can greet before the first request)
+      account: session && session.accountId ? this.accountProfile(session.accountId) : null,
+      // the reason a presented key was refused (ACCOUNT_BAD_KEY / RATE / INTERNAL) — the client prompts for a new key
+      accountError: session ? session.accountError || undefined : undefined,
+    };
+  }
+
+  // ---------------------------------------------------------------------------------------------------
+  // Accounts & friends (DESIGN §27)
+  //
+  // The rules live in server/accounts.js; this section is the wire + room side of them:
+  //   * binding a key to a session (hello.key / account.login), including the per-session failure throttle;
+  //   * the social snapshot (friend.state) and its increments (friend.request / friend.update / friend.remove /
+  //     invite / invite.done), pushed only to the accounts they concern;
+  //   * presence derived from the rooms this lobby owns — the one thing the account store cannot know;
+  //   * the share-link origin (SP_PUBLIC_ORIGINS + the connection origin).
+  // ---------------------------------------------------------------------------------------------------
+
+  /** The public shape of an account by id, or null. @returns {{ accountId: string, name: string } | null} */
+  accountProfile(accountId) {
+    if (!this.accounts || !accountId) return null;
+    return this.accounts.profile(this.accounts.get(accountId));
+  }
+
+  /** The account record of a session (null for a guest or when accounts are off). */
+  accountOf(session) {
+    if (!this.accounts || !session || !session.accountId) return null;
+    return this.accounts.get(session.accountId);
+  }
+
+  /**
+   * `hello.key` / `account.login`: prove a key and bind the session to the account. The account name is authoritative
+   * over the title-screen nickname (one name, editable through account.rename), so a resume cannot drift from it.
+   * @param {import('./net.js').Session} session @param {unknown} key
+   * @returns {{ error: string } | null}
+   */
+  bindAccount(session, key) {
+    if (!this.accounts) return { error: ERR.ACCOUNT_REQUIRED };
+    if (!this.accounts.login) return { error: ERR.INTERNAL };
+    // No key at all: a token resume keeps the account it already had (a plain reconnect never logs anyone out), but
+    // the account name is authoritative, so a hello nickname cannot make the id show up under another name.
+    if (key == null || key === '') {
+      const held = session.accountId ? this.accounts.get(session.accountId) : null;
+      if (held) session.name = held.name;
+      return null;
+    }
+    const now = this.now();
+    // Failure throttle: a socket may present at most maxJoinFails wrong keys per window; after that we stop hashing.
+    if (session.authFailsAt && now - session.authFailsAt > this.opts.joinFailWindowMs) session.authFails = 0;
+    session.authFailsAt = now;
+    if (session.authFails >= this.opts.maxJoinFails) return { error: ERR.RATE };
+    const res = this.accounts.login(key);
+    if (!res.ok) { session.authFails++; return { error: res.error }; }
+    session.authFails = 0;
+    const previous = session.accountId;
+    session.accountId = res.account.id;
+    session.name = res.account.name;
+    this.accounts.touch(res.account);
+    if (previous !== res.account.id) this.log.info(`[lobby] ${session.addr} logged in as ${res.account.id} (${res.account.name})`);
+    // switching accounts on one session: the account left behind is offline now (unless another session holds it)
+    if (previous && previous !== res.account.id) this.notifyFriends(previous);
+    // keep an existing seat's visible name in step (LOBBY only, exactly like a reconnect rename)
+    const room = this.roomOf(session);
+    if (room && !room.match) {
+      const seat = room.seatOf(session.playerId) || room.spectatorOf(session.playerId);
+      if (seat && seat.name !== session.name) { seat.name = session.name; this.broadcastState(room); }
+    }
+    return null;
+  }
+
+  /**
+   * The share-link origin of a connection (DESIGN §27.1, shared/origin.js). Never throws, never trusts blindly:
+   * the reported origin must be the allowlisted one (when an allowlist is configured) or this connection's own origin.
+   * @param {import('./net.js').Session} session @param {string | null} reported @param {string | null} connOrigin
+   * @returns {string | null}
+   */
+  resolveOrigin(session, reported, connOrigin) {
+    if (this.opts.shareLink === false) return null;
+    const clean = typeof reported === 'string' ? canonicalOrigin(reported) : null;
+    return pickShareOrigin({ reported: clean, connOrigin: connOrigin || null, allow: this.shareOrigins });
+  }
+
+  /**
+   * `share.link`: the canonical link for the session's current room. The reply flows through the `ok` payload
+   * (server/net.js merges `res.payload` into the ok frame) so the client gets a link it can put on the clipboard.
+   * `source` tells the client where the origin came from: 'allowlist' (pinned by the operator), 'connection' (the
+   * address this player used), or 'none' (no server opinion — the client builds the link from location.origin).
+   */
+  shareLink(session) {
+    const origin = session.shareOrigin || null;
+    const room = this.roomOf(session);
+    const code = room ? room.code : null;
+    const source = !origin ? 'none' : this.shareOrigins.length ? 'allowlist' : 'connection';
+    const url = origin && code ? `${origin}/?room=${encodeURIComponent(code)}` : (origin ? `${origin}/` : null);
+    return { ok: true, payload: { origin, url, code, source } };
+  }
+
+  /** `account.create`: mint an account for this session (the key is returned once) and bind it. */
+  accountCreate(session, { name }) {
+    if (!this.accounts) return fail(ERR.ACCOUNT_REQUIRED);
+    if (session.accountId) return fail(ERR.ALREADY, 'this session already has an account');
+    const res = this.accounts.create({ name, addrKey: session.limitKey || null });
+    if (!res.ok) return fail(res.error, res.detail);
+    session.accountId = res.account.id;
+    session.name = res.account.name;
+    const room = this.roomOf(session);
+    if (room && !room.match) {
+      const seat = room.seatOf(session.playerId) || room.spectatorOf(session.playerId);
+      if (seat) { seat.name = session.name; this.broadcastState(room); }
+    }
+    this.sendAccountState(session, { key: res.key });
+    this.sendFriendState(session);
+    this.notifyFriends(session.accountId);
+    this.log.info(`[lobby] account ${res.account.id} (${res.account.name}) created for ${session.addr}`);
+    return OK;
+  }
+
+  /** `account.login`: switch this session to an account (or re-login after a lost key). */
+  accountLogin(session, { key }) {
+    if (!this.accounts) return fail(ERR.ACCOUNT_REQUIRED);
+    const err = this.bindAccount(session, key);
+    if (err) return fail(err.error);
+    this.sendAccountState(session);
+    this.sendFriendState(session);
+    this.notifyFriends(session.accountId);
+    return OK;
+  }
+
+  /** `account.rename`: the account name is the single visible name (seat, friends, invites). */
+  accountRename(session, { name }) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const res = this.accounts.rename(account, name);
+    if (!res.ok) return fail(res.error, res.detail);
+    session.name = res.account.name;
+    const room = this.roomOf(session);
+    if (room && !room.match) {
+      const seat = room.seatOf(session.playerId) || room.spectatorOf(session.playerId);
+      if (seat) { seat.name = session.name; this.broadcastState(room); }
+    }
+    this.sendAccountState(session);
+    this.sendFriendState(session);
+    this.notifyFriends(session.accountId, true);
+    return OK;
+  }
+
+  /**
+   * `account.rotate`: mint a new key and drop every OTHER live session of this account (a rotated key must not keep
+   * working for a socket that may have been stolen). The caller keeps its session and receives the new key once.
+   */
+  accountRotate(session) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const res = this.accounts.rotate(account);
+    if (!res.ok) return fail(res.error);
+    let dropped = 0;
+    for (const s of this.registry.all()) {
+      if (s === session || s.accountId !== account.id) continue;
+      s.accountId = null;
+      s.accountError = ERR.ACCOUNT_BAD_KEY;
+      dropped++;
+      try { s.ws?.close(4004, 'account key rotated'); } catch { /* ignore */ }
+    }
+    this.sendAccountState(session, { key: res.key });
+    if (dropped) this.log.info(`[lobby] rotation of ${account.id} dropped ${dropped} other session(s)`);
+    return OK;
+  }
+
+  /**
+   * `account.logout`: this session stops using the account. The key stays valid (only `account.rotate` kills a key) —
+   * this is the "shared computer" / "hand the laptop over" button. The guest keeps its nickname and its seat.
+   */
+  accountLogout(session) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    session.accountId = null;
+    this.sendAccountState(session);
+    // the account is offline as far as its friends are concerned (unless another session is still logged in)
+    this.notifyFriends(account.id, true);
+    return OK;
+  }
+
+  /** The `account.state` push: `{ account, key? }` — the key only ever rides on create/rotate. */
+  sendAccountState(session, extra) {
+    const profile = this.accountProfile(session.accountId);
+    const msg = { t: 'account.state', account: profile, key: extra && extra.key ? extra.key : undefined };
+    sendSession(session, msg);
+  }
+
+  /** `friend.request` — only a played-together partner may be asked (server/accounts.js NOT_ELIGIBLE otherwise). */
+  friendRequest(session, { accountId }) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const res = this.accounts.requestFriend(account, accountId);
+    if (!res.ok) return fail(res.error, res.detail);
+    if (res.accepted) {
+      // a mutual request went straight through: both sides get the new snapshot and each other's presence
+      this.sendFriendState(session);
+      this.sendToAccount(accountId, { t: 'friend.state', ...this.friendSnapshot(accountId) });
+      this.notifyFriends(account.id, true);
+      this.notifyFriends(accountId, true);
+      this.log.info(`[lobby] ${account.id} <-> ${accountId} friends (mutual request)`);
+      return OK;
+    }
+    this.sendFriendState(session);
+    this.sendToAccount(accountId, { t: 'friend.request', accountId: account.id, name: account.name, at: this.now() });
+    return OK;
+  }
+
+  friendAccept(session, { accountId }) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const res = this.accounts.acceptFriend(account, accountId);
+    if (!res.ok) return fail(res.error, res.detail);
+    this.sendFriendState(session);
+    this.sendToAccount(accountId, { t: 'friend.state', ...this.friendSnapshot(accountId) });
+    this.notifyFriends(account.id, true);
+    this.notifyFriends(accountId, true);
+    return OK;
+  }
+
+  friendDecline(session, { accountId }) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const res = this.accounts.declineFriend(account, accountId);
+    if (!res.ok) return fail(res.error, res.detail);
+    this.sendFriendState(session);
+    this.sendToAccount(accountId, { t: 'friend.state', ...this.friendSnapshot(accountId) });
+    return OK;
+  }
+
+  friendRemove(session, { accountId }) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const other = this.accounts.get(accountId);
+    const res = this.accounts.removeFriend(account, accountId);
+    if (!res.ok) return fail(res.error, res.detail);
+    this.sendFriendState(session);
+    this.sendToAccount(accountId, { t: 'friend.remove', accountId: account.id, name: account.name });
+    this.sendToAccount(accountId, { t: 'friend.state', ...this.friendSnapshot(accountId) });
+    if (other) this.log.info(`[lobby] ${account.id} removed ${other.id} from friends`);
+    return OK;
+  }
+
+  /** `friend.sync`: resend the whole social snapshot (after login, a resume, or a client-side reset). */
+  friendSync(session) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    this.sendFriendState(session);
+    return OK;
+  }
+
+  sendFriendState(session) {
+    if (!session.accountId) return;
+    sendSession(session, { t: 'friend.state', ...this.friendSnapshot(session.accountId) });
+  }
+
+  /**
+   * `invite.send`: ask the server to deliver an invitation to the room this session is in to one friend. The invite is
+   * minted by the store (bound to the recipient, expiring) and pushed to every live session of that account.
+   */
+  inviteSend(session, { accountId }) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const room = this.roomOf(session);
+    if (!room) return fail(ERR.NOT_IN_ROOM);
+    if (room.match) return fail(ERR.ROOM_STARTED, 'the match already started');
+    if (room.mode === 'solo') return fail(ERR.ROOM_FULL, 'solo room');
+    if (room.freeSeat() < 0) return fail(ERR.ROOM_FULL);
+    if (room.spectatorOf(session.playerId)) return fail(ERR.SPECTATOR);
+    const res = this.accounts.createInvite(account, accountId, {
+      code: room.code, mode: room.mode, difficulty: room.difficulty, players: room.activeHumans().length,
+    });
+    if (!res.ok) return fail(res.error, res.detail);
+    const delivered = this.sendToAccount(accountId, { t: 'invite', ...res.invite });
+    if (delivered === 0) {
+      // the friend is offline: the invite stays valid until it expires (they may resume within the window)
+      this.log.info(`[lobby] invite ${res.invite.id} queued for offline ${accountId}`);
+    }
+    return OK;
+  }
+
+  /**
+   * `invite.accept`: consume the invite and join through the same gates as `room.join` (mode, seat, not started) —
+   * an invite can never bypass a room's rules, it only saves typing the code. The sender is told the outcome.
+   */
+  inviteAccept(session, { inviteId }) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const res = this.accounts.takeInvite(account.id, inviteId);
+    if (!res.ok) return fail(res.error);
+    const invite = res.invite;
+    const joined = this.join(session, { code: invite.code });
+    if (joined.error) {
+      this.sendToAccount(invite.from, { t: 'invite.done', inviteId: invite.inviteId, ok: false, reason: joined.error });
+      return joined;
+    }
+    this.sendToAccount(invite.from, { t: 'invite.done', inviteId: invite.inviteId, ok: true, by: account.name });
+    this.notifyFriends(account.id, true);
+    return OK;
+  }
+
+  inviteDecline(session, { inviteId }) {
+    const account = this.accountOf(session);
+    if (!account) return fail(ERR.ACCOUNT_REQUIRED);
+    const res = this.accounts.declineInvite(account.id, inviteId);
+    if (!res.ok) return fail(res.error);
+    this.sendToAccount(res.invite.from, { t: 'invite.done', inviteId: res.invite.inviteId, ok: false, declined: true });
+    return OK;
+  }
+
+  /**
+   * The whole social snapshot for one account: who is online and where, pending requests both ways, the met list (the
+   * only addable people) and the pending invites. A friend's room is included only when they did not hide it.
+   */
+  friendSnapshot(accountId) {
+    const account = this.accounts ? this.accounts.get(accountId) : null;
+    if (!account) return { account: null, friends: [], incoming: [], outgoing: [], met: [], invites: [] };
+    const index = this.accountSessionIndex();
+    const friends = [];
+    for (const id of account.friends) {
+      const presence = this.presenceOf(id, index);
+      if (presence) friends.push(presence);
+    }
+    friends.sort((a, b) => (a.online === b.online ? a.name.localeCompare(b.name) : a.online ? -1 : 1));
+    const pairs = (set) => [...set].map((id) => {
+      const other = this.accounts.get(id);
+      return other ? { accountId: other.id, name: other.name } : null;
+    }).filter(Boolean);
+    return {
+      account: { accountId: account.id, name: account.name },
+      friends,
+      incoming: pairs(account.incoming),
+      outgoing: pairs(account.outgoing),
+      met: this.accounts.metList(account),
+      invites: this.accounts.invitesFor(accountId),
+    };
+  }
+
+  /**
+   * Where an account is right now, as its friends see it. `status`:
+   *   'offline'  no live session
+   *   'idle'     online, not in a room
+   *   'lobby'    in a room whose match has not started (joinable when a seat is free)
+   *   'match'    in a running match (only watching is possible)
+   *   'hidden'   in a room created with 屏蔽好友 — friends learn nothing but "not available"
+   * The room (code / difficulty / occupancy) is included only when it is not hidden: a room code is the ability to
+   * join, so it is never leaked past a friend's own list, and never for a hidden room.
+   * @returns {{ accountId: string, name: string, online: boolean, status: string, room: object | null } | null}
+   */
+  /**
+   * Live sessions per account id. The registry is a flat list, so a presence push, a snapshot or a targeted frame would
+   * otherwise cost O(sessions) each; one index per operation keeps the social layer independent of server size.
+   * @returns {Map<string, import('./net.js').Session[]>}
+   */
+  accountSessionIndex() {
+    const index = new Map();
+    for (const s of this.registry.all()) {
+      if (!s.accountId || !s.connected) continue;
+      const list = index.get(s.accountId);
+      if (list) list.push(s);
+      else index.set(s.accountId, [s]);
+    }
+    return index;
+  }
+
+  presenceOf(accountId, index = null) {
+    const account = this.accounts ? this.accounts.get(accountId) : null;
+    if (!account) return null;
+    const sessions = (index || this.accountSessionIndex()).get(accountId) || [];
+    let anyOnline = sessions.length > 0;
+    let room = null;
+    for (const s of sessions) {
+      room = this.roomOf(s);
+      if (room) break;
+    }
+    const base = { accountId: account.id, name: account.name, online: anyOnline, status: 'idle', room: null };
+    if (!anyOnline) return { ...base, status: 'offline' };
+    if (!room) return base;
+    if (room.hideFromFriends) return { ...base, status: 'hidden' };
+    // A solo run is nobody's business: it cannot be joined or watched, so only the fact of it is shared.
+    if (room.mode === 'solo') return { ...base, status: 'solo' };
+    return {
+      ...base,
+      status: room.match ? 'match' : 'lobby',
+      room: {
+        code: room.code, mode: room.mode, difficulty: room.difficulty,
+        players: room.activeHumans().length,
+        joinable: !room.match && room.freeSeat() >= 0,
+        spectatable: room.spectators.length < MAX_SPECTATORS,
+      },
+    };
+  }
+
+  /** Push one frame to every live session logged in as `accountId`. @returns {number} sessions reached */
+  sendToAccount(accountId, msg, index = null) {
+    if (!this.accounts || !accountId) return 0;
+    const list = (index || this.accountSessionIndex()).get(accountId);
+    if (!list || list.length === 0) return 0;
+    let n = 0;
+    for (const s of list) if (s.connected && s.ws && sendSession(s, msg)) n++;
+    return n;
+  }
+
+  /**
+   * Tell an account's online friends where it is now. Coalesced per account (friendPushMs): a player toggling ready
+   * and switching seats must not turn into a push storm on their friends' sockets. force=true skips the throttle
+   * (a relationship or name change must be seen immediately).
+   */
+  notifyFriends(accountId, force = false) {
+    if (!this.accounts || !accountId) return;
+    const account = this.accounts.get(accountId);
+    if (!account || account.friends.size === 0) return;
+    const last = this.friendPushAt.get(accountId);
+    const wait = typeof last === 'number' ? last + this.opts.friendPushMs - this.now() : 0;
+    if (!force && wait > 0) {
+      if (this.friendPushTimers.has(accountId)) return;
+      const t = setTimeout(() => {
+        this.friendPushTimers.delete(accountId);
+        this.pushPresence(accountId);
+      }, wait);
+      t.unref?.();
+      this.friendPushTimers.set(accountId, t);
+      return;
+    }
+    this.pushPresence(accountId);
+  }
+
+  /** @param {string} accountId */
+  pushPresence(accountId) {
+    if (!this.accounts) return;
+    const account = this.accounts.get(accountId);
+    if (!account) return;
+    this.friendPushAt.set(accountId, this.now());
+    if (this.friendPushAt.size > 4096) {
+      // bounded: drop the oldest half (only used as a throttle timestamp)
+      const old = [...this.friendPushAt.entries()].sort((a, b) => a[1] - b[1]).slice(0, 2048).map(([k]) => k);
+      for (const k of old) this.friendPushAt.delete(k);
+    }
+    const entry = this.presenceOf(accountId);
+    if (!entry) return;
+    // Content dedupe: a ready toggle rebroadcasts the room but changes nothing a friend can see. Keeping the last
+    // frame per account means friends hear about status changes only (and never twice).
+    const frame = JSON.stringify(entry);
+    if (this.presenceFrames.get(accountId) === frame) return;
+    this.presenceFrames.set(accountId, frame);
+    if (this.presenceFrames.size > 4096) {
+      const old = [...this.presenceFrames.keys()].slice(0, 2048);
+      for (const k of old) this.presenceFrames.delete(k);
+    }
+    const index = this.accountSessionIndex();
+    for (const fid of account.friends) this.sendToAccount(fid, { t: 'friend.update', ...entry }, index);
+  }
+
+  /** The account ids of the human players in a room (bots and spectators excluded) — the match ledger input. */
+  accountIdsOf(room) {
+    const out = [];
+    for (const s of room.seats) {
+      if (!s || s.isBot || s.left) continue;
+      const session = this.registry.byId(s.playerId);
+      if (session && session.accountId) out.push(session.accountId);
+    }
+    return out;
   }
 
   // ---------------------------------------------------------------------------------------------------
@@ -692,6 +1265,10 @@ export class Lobby {
       room.replay = null;
       room.matchCount++;
       this.log.info(`[lobby] ${room.code} match #${room.matchCount} starting (${room.mode}/${room.difficulty}, ${seats.length} seats, seed ${seed})`);
+      // The "played together" ledger (DESIGN §27): the humans who entered this match may become friends afterwards.
+      // Recorded here, at the start of a match both sides are in — the friend rule is "played together", and a match
+      // that starts always produces combat. Bots, spectators and departed players are not part of it.
+      if (this.accounts) this.accounts.recordPlayed(this.accountIdsOf(room));
       this.broadcastState(room);
       match.start();
     } catch (e) {
@@ -1031,6 +1608,18 @@ export class Lobby {
       else session.notice = reason;
     }
     if (ctx) this.disposeMatchCtx(ctx);
+    // pending quick invites to this room die with it (their sender is told, so nobody waits on a dead code)
+    if (this.accounts) {
+      for (const inv of this.accounts.dropInvitesForRoom(room.code)) {
+        this.sendToAccount(inv.from, { t: 'invite.done', inviteId: inv.inviteId, ok: false, reason: 'room-closed' });
+      }
+      // the members just lost their room: their friends' view of them changes to idle
+      for (const seat of [...room.seats, ...room.spectators]) {
+        if (!seat || seat.isBot) continue;
+        const session = this.registry.byId(seat.playerId);
+        if (session && session.accountId) this.notifyFriends(session.accountId, true);
+      }
+    }
     this.log.info(`[lobby] ${room.code} disposed (${reason})`);
   }
 
@@ -1060,6 +1649,19 @@ export class Lobby {
     if (room.disposed) return;
     const data = encode(room.toState());
     for (const session of this.memberSessions(room)) sendRaw(session.ws, data);
+    // every visible room change is also a presence change for the members' friends (status, room, occupancy);
+    // notifyMembers is content-deduped and coalesced per account, so a ready toggle costs nothing on the wire
+    this.notifyMembers(room);
+  }
+
+  /** Notify the friends of every signed-in member of a room (see broadcastState). */
+  notifyMembers(room) {
+    if (!this.accounts) return;
+    for (const seat of [...room.seats, ...room.spectators]) {
+      if (!seat || seat.isBot || seat.left) continue;
+      const session = this.registry.byId(seat.playerId);
+      if (session && session.accountId) this.notifyFriends(session.accountId);
+    }
   }
 
   sendState(room, session) {
